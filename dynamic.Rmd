@@ -1,0 +1,353 @@
+---
+title: "Exemple modèle d'occupancy dynamique"
+author: "Olivier Gimenez"
+date: "19/10/2020"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, 
+                      message = FALSE, 
+                      warning = FALSE, 
+                      dpi = 300, 
+                      fig.height = 6, 
+                      fig.width = 1.777777*6)
+library(tidyverse)
+library(sf)
+theme_set(theme_light(base_size = 16))
+set.seed(1234)
+```
+
+### 1. Lecture des données
+
+On charge le package `unmarked` pour ajuster les modèles dynamique d'occupancy.
+```{r}
+library(unmarked)
+```
+
+Les données sont celles du stage de Valentin, jusqu'à 2017 si je ne m'abuse, mises à jour entre Valentin, Julie et Christophe, en particulier sur l'effort. 
+On a les données de détections/non-détections dans l'objet `y`, de dimensions le nombre de cellules de la grille utilisée, le nombre d'occasions secondaires (les mois d'hiver) et le nombre d'années. A noter que pur prendre en compte l'effort de prospection nul pour certaines années sur certaines cellules, on a dans les obs des NA.
+```{r}
+load("dat/WS.RData")
+dim(y)
+```
+```{r echo = FALSE}
+PO2 <- PO
+PO2[PO2==0] <- NA
+mask <- is.na(PO2)
+for (i in 1:nrow(mask)){
+  for (j in 1:ncol(mask)){
+    if (mask[i,j]) y[i,1:4,j] <- NA 
+  }
+}
+```
+
+### 2. Formatage des données
+
+On met les données de détection/non-détection au format `unmarked` avec occasions primaire et secondaires.
+```{r}
+Yter <- y[,,1]
+for (i in 2:dim(y)[3]){
+  Yter <- cbind(Yter,y[,,i])
+}
+dim(Yter) # 3547 x 92 ou 92 est 4 occ x 23 ans
+```
+
+On vérifie que tous les sites ont au moins 1 obs, et on supprime les cellules sur lesquelles aucun échantillonnage n'a jamais été fait dans les données. On fait pareil pour les covariables.
+```{r}
+ind <- apply(Yter, 1, function(x) all(is.na(x)))
+sum(ind)
+Yter <- Yter[!ind, ]
+y <- y[!ind,, ]
+mask <- mask[!ind,]
+dim(CovEnvbis) # covariables environnementales
+CovEnvbis <- CovEnvbis[!ind, ]
+dim(Sbis) # autocorrélation spatiale à courte distance = 10km = 8 voisins proches 
+Sbis <- Sbis[!ind,]
+dim(Lbis) # autocorrélation spatiale à longue distance = 150 km
+Lbis <- Lbis[!ind,]
+dim(PO) # la fameuse pression d'observation 
+PO <- PO[!ind,]
+```
+
+On rassemble les covariables dont les valeurs diffèrent selon la cellule uniquement.
+```{r}
+sites.covs <- data.frame(
+  forest = CovEnvbis[,"p_forest"], 
+  agr = CovEnvbis[,"p_agri"], 
+  rock = CovEnvbis[,"p_rock"], 
+  halt = CovEnvbis[,"p_halt"], 
+  alt = CovEnvbis[,"p_alti"], 
+  dbarr = CovEnvbis[,"p_dbarr"],
+  acc = CovEnvbis[,"p_road"])
+```
+
+On rassemble les covariables dont les valeurs diffèrent selon la cellule et l'année.
+```{r}
+year <- matrix(rep(c('01',
+             '02',
+             '03',
+             '04',
+             '05',
+             '06',
+             '07',
+             '08',
+             '09',
+             '10',
+             '11',
+             '12',
+             '13',
+             '14',
+             '15',
+             '16',
+             '17',
+             '18',
+             '19',
+             '20',
+             '21',
+             '22',
+             '23'), nrow(Yter)), 
+             nrow = nrow(Yter), 
+             ncol = 23, 
+             byrow = TRUE)
+trendyear <- matrix(rep(1:23,nrow(Yter)), 
+                    nrow=nrow(Yter),
+                    ncol=23, 
+                    byrow=TRUE)
+yearly.site.covs <- list(
+  PO = PO[,1:23], # effort echantillonnage (prospection theorique)
+  year = year, # effet annee
+  trendyear = trendyear, # tendance lineaire annee
+  SDAC = Sbis[,1:23], # autocorrelation courte distance
+  LDAC = Lbis[,1:23]) # autocorrelation longue distance
+```
+
+On rassemble les covariables dont les valeurs diffèrent selon les occasions secondaires.
+```{r}
+occ <- array(0,dim(y))
+for (i in 1:dim(y)[1]){
+	for (j in 1:dim(y)[3]){
+		occ[i,1:dim(y)[2],j] <- c('1','2','3','4') # dec, jan, fev, mar
+		if (mask[i,j]) occ[i,1:dim(y)[2],j] <- NA
+				}
+	}
+occbis <- occ[,,1]
+for (i in 2:dim(y)[3]){
+	occbis <- cbind(occbis,occ[,,i])
+}
+dim(occbis) # 3450 x 92 ou 92 est 4 occ x 23 ans
+obs.covs <- list(OCC = occbis)
+```
+
+On crée un `data.frame` (un objet fourre-tout dans `R`) pour passer dans le package `unmarked`. 
+```{r}
+umf <- unmarkedMultFrame(y = Yter, 
+                         siteCovs = sites.covs,
+                         yearlySiteCovs = yearly.site.covs, 
+                         obsCovs = obs.covs,
+                         numPrimary = 23)
+```
+
+En résumé, on a quoi dans ces données? 
+```{r}
+summary(umf)
+```
+
+### 3. Estimation des paramètres
+
+Ici on ajuste le meilleur modèle d'occupancy trouvé dans le papier de Julie. Cela prend 4-5 minutes sur mon ordinateur. Un peu long, mais bcp moins que les plusieurs heures nécessaires à ajuster le modèle en bayésien.
+```{r eval = FALSE}
+fm <- colext(
+  psiformula = ~ 1,                                            # initial occupancy
+  gammaformula =  ~ forest + agr + halt + alt + SDAC + LDAC,  # colonization
+  epsilonformula = ~ 1,                                       # extinction
+  pformula = ~ PO + acc + OCC,                                # detection
+  umf,
+  control = list(trace = 1, maxit = 1e4), 
+  se = FALSE) # pour aller plus vite, je ne calcule pas les SE et intervalles de confiance
+save(fm, file = "res/dynoccloup.RData")
+```
+
+On obtient les estimations ci-dessous.
+```{r}
+load("res/dynoccloup.RData")
+fm
+```
+
+Ces estimations sont sur l'échelle logit. Pour aller plus vite, je n'ai pas calculé les SE, d'où les NA dans les sorties du modèle. Le plus important est qu'elles sont proches des estimations obtenues en bayésien pour le papier de Julie.
+
+### 4. Visualisation de l'occupancy
+
+Pour faire une carte annuelle de la probabilité d'occupancy, soit on passe par la probabilité d'occupancy $\psi_{i,t}$, soit on se base directement sur l'occupancy réalisée, c'est-à-dire la variable latente $z_{i,t}$ qui nous dit si la cellule $i$ est occupée l'année $t$ ($z_{i,t} = 1$) ou pas ($z_{i,t} = 0$). On va se baser sur l'occupancy réalisée. Pour ce faire, il nous faut l'estimation des $z$ qu'on obtient dans `unmarked` via des méthodes Bayésiennes empiriques : on estime la distribution a posteriori de la variable latente $z$ avec les données et les estimations du max de vraisemblance obtenue au-dessus. Le mode de la distribution a posteriori est le "empirical best unbiased predictor (EBUP)". 
+```{r}
+re <- ranef(fm)
+#confint(re, level = 0.9) # 90% CI
+#z_mean <- bup(re, stat = "mean")           # Posterior mean
+z_mode <- bup(re, stat = "mode")           # Posterior mode
+#head(z_mode)
+#dim(z_mode)
+```
+
+L'objet `z_mode` contient les $z$ estimés avec en lignes les cellules de la grille et en colonnes les années. Mettons tout ça sur une carte. 
+On charge une carte de la France.
+```{r}
+pays <-  st_read("shp/pays/Country.shp")
+```
+
+Puis notre grille complète 10km par 10km. 
+```{r}
+grid_rect <- st_read("shp/grille10par10//grille_France.shp") %>% 
+  st_transform(crs= st_crs(pays))
+```
+
+On récupère les coordonnées de nos cellules échantillonnées au moins une fois au cours de l'étude. 
+```{r}
+grid <- ZST[!ind,] %>% 
+  as_tibble() %>% 
+  st_as_sf(coords = c('X','Y'), crs = st_crs(grid_rect))
+```
+
+L'objet `grid` ainsi créé est un objet spatial `sf` de type `POINT`, il me faudrait plutôt des `POLYGONS` pour les représenter en couleur sur la grille. 
+```{r}
+grid_poly <- st_join(grid_rect, grid, join = st_covers)
+grid_poly <- grid_poly[!is.na(grid_poly$id),]
+```
+
+Enfin, une carte ! On prend l'année 2017 la plus récente dans le jeu de données. 
+```{r}
+grid_rect %>% 
+  ggplot() + 
+  geom_sf(alpha = 0, lwd = 0.01) + 
+  geom_sf(data = grid_poly, aes(fill = as_factor(z_mode[,23])), 
+          lwd = 0.01) + 
+  geom_sf(data = pays %>% filter(NAME == "France"), alpha = 0) +
+  scale_fill_manual(name = "",
+                    values = c("gray90",
+                               "steelblue1"),
+                    labels = c("cellule non-occupée", 
+                               "cellule occupée")) +
+  labs(title = "Carte de l'occupancy du loup en 2017",
+       subtitle = "Données réseau loup")
+```
+
+Construisons une fonction qui fait la carte de l'occupancy pour une année quelconque. Cette fonction prend comme argument *year* entre 1995 et 2017.
+```{r}
+occ_plot <- function(year){
+  if (year < 1995) stop("Le loup venait juste d'arriver, pas la peine d'en faire une carte")
+  if (year > 2017) stop("Pas de données aussi récentes, va falloir attendre")
+  index <- year - 1994
+  grid_rect %>% 
+  ggplot() + 
+  geom_sf(alpha = 0, lwd = 0.01) + 
+  geom_sf(data = grid_poly, aes(fill = as_factor(z_mode[,index])), 
+          lwd = 0.01) + 
+  geom_sf(data = pays %>% filter(NAME == "France"), alpha = 0) +
+  scale_fill_manual(name = "",
+                    values = c("gray90",
+                               "steelblue1"),
+                    labels = c("non-occupée", 
+                               "occupée")) +
+  labs(subtitle = year) +
+  theme(legend.position = "none")  
+}
+```
+
+On fait un essai avec l'année 2016.
+```{r}
+occ_plot(2016)
+```
+
+On fait 3 cartes pour les années 2000, 2010 et 2017.
+```{r}
+library(patchwork)
+plot_list <- lapply(X = c(2000, 2010, 2017), FUN = occ_plot)
+plot_list[[1]] | plot_list[[2]] | plot_list[[3]]
+```
+
+### 5. Comparaison ZPP et occupancy
+
+Essayons maintenant de superposer les ZPPs sur ces cartes. On récupère les ZPPs. 
+```{r}
+zpp <- st_read("shp/ZPP2018/ZPP_HIV_2018.shp") %>%
+  st_transform(st_crs(pays))
+```
+
+Oksana rappelle qu'il y plusieurs colonnes "X14_15" (hiver 2014), "X15_16" (hiver 2015), "ETE_2016", "HIV_16" etc jusqu'en 2018. Pour chaque colonne il y a un code associé (chiffre entre 0 et 6) :
+
+* 0. Sans objet
+* 1. ZPP meute
+* 2. ZPP non meute
+* 3. Secteur à suivre (pas encore zpp)
+* 4. ZPP en sursis (1ere année sans indice si 2eme alors passe 5)
+* 5. Disparue
+* 6. ?? (idem à 5) je connais pas ce code
+
+Donc toutes les ZPP avec un 5 dans leur colonne sont considérées comme disparue pour le suivi annuel correspondant.
+
+Toutes les ZPPs sont-elles encore actives en 2017 ?
+```{r}
+zpp %>%
+  pull(FIN_ZPP)
+```
+
+On dirait que oui, ou bien je ne comprends pas la colonne *FIN_ZPP*.
+
+Depuis quand les ZPPs sont-elles actives?
+```{r}
+zpp %>%
+  select(ZPPdepuis) %>%
+  as_tibble() %>%
+  select(-geometry) %>%
+  count(ZPPdepuis, sort = TRUE)
+```
+Je ne comprends pas à quoi correspondents les 0 et les NA.
+
+Bref, faisons comme si je comprenais bien ce qui est dans le jeu de données des ZPPs, on refait nos cartes avec les ZPPs. 
+
+```{r}
+occ_plot <- function(year){
+  if (year < 1995) stop("Le loup venait juste d'arriver, pas la peine d'en faire une carte")
+  if (year > 2017) stop("Pas de données aussi récentes, va falloir attendre")
+  index <- year - 1994
+  grid_rect %>% 
+    ggplot() + 
+  geom_sf(alpha = 0, lwd = 0.01) + 
+  geom_sf(data = grid_poly, 
+          aes(fill = as_factor(z_mode[,index])), 
+          lwd = 0.01) + 
+  geom_sf(data = pays %>% filter(NAME == "France"), 
+          alpha = 0) +
+  scale_fill_manual(name = "",
+                    values = c("gray95",
+                               "steelblue1"),
+                    labels = c("cellule non-occupée", 
+                               "cellule occupée"),
+                    guide = guide_legend(override.aes = list(linetype = "blank", 
+                                                             shape = NA))) +
+  geom_sf(data = zpp %>% filter(ZPPdepuis <= year), 
+          aes(color = "blue"),
+          show.legend = "point") + 
+  scale_color_manual(name = "",
+                    values = c("blue"),
+                    labels = c("ZPP"),
+                    guide = guide_legend(override.aes = list(linetype = "blank", 
+                                                             shape = 21,
+                                                             size = 2))) +
+  labs(subtitle = year) +
+  theme(legend.position = "none")
+}
+```
+
+On fait un essai avec l'année 2016.
+```{r}
+occ_plot(2016)
+```
+
+On fait 3 cartes pour les années 2000, 2010 et 2017.
+```{r}
+plot_list <- lapply(X = c(2000, 2010, 2017), FUN = occ_plot)
+plot_list[[1]] | plot_list[[2]] | plot_list[[3]]
+```
+
