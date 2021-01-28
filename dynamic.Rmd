@@ -328,7 +328,8 @@ occ_plot <- function(year){
                                                              shape = NA))) +
   geom_sf(data = zpp %>% filter(ZPPdepuis <= year), 
           aes(color = "blue"),
-          show.legend = "point") + 
+          show.legend = "point",
+          alpha = 0.3) + 
   scale_color_manual(name = "",
                     values = c("blue"),
                     labels = c("ZPP"),
